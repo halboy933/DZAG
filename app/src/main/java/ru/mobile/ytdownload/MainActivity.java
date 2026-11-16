@@ -88,13 +88,18 @@ public final class MainActivity extends Activity {
         final String extension;
         final String mime;
         final boolean audio;
+        final Stream companionAudio;
 
         Choice(Stream stream, String label, String extension, String mime, boolean audio) {
+            this(stream, label, extension, mime, audio, null);
+        }
+        Choice(Stream stream, String label, String extension, String mime, boolean audio, Stream companionAudio) {
             this.stream = stream;
             this.label = label;
             this.extension = extension;
             this.mime = mime;
             this.audio = audio;
+            this.companionAudio = companionAudio;
         }
         @Override public String toString() { return label; }
     }
@@ -138,7 +143,7 @@ public final class MainActivity extends Activity {
         scroll.addView(root);
         setContentView(scroll);
 
-        TextView appTitle = text("ЮТ ЗАГРУЗЧИК", 18, TEXT, true);
+        TextView appTitle = text("ЮТ ЗАГРУЗЧИК · V3", 18, TEXT, true);
         appTitle.setLetterSpacing(0.15f);
         root.addView(appTitle);
         TextView subtitle = text("Твой карманный киносеанс \u25b6", 13, SUBTEXT, false);
@@ -238,7 +243,7 @@ public final class MainActivity extends Activity {
         savePathText = text("Папка: Загрузки / ЮТ Загрузчик", 13, SUBTEXT, false);
         addMargin(root, savePathText, 0, 8, 0, 15);
 
-        TextView tip = text("Важно: выбирайте вариант «видео со звуком». 1080p/4K могут отсутствовать в v1: YouTube раздаёт такие дорожки раздельно.", 13, SUBTEXT, false);
+        TextView tip = text("Важно: выбирайте вариант «видео со звуком». Отдельные дорожки MP4 или WEBM объединяются автоматически. Во время загрузки держите приложение открытым. Если выбран «Только звук», видео не сохранится.", 13, SUBTEXT, false);
         tip.setPadding(dp(14), dp(14), dp(14), dp(14));
         tip.setBackground(round(PANEL, 12));
         addMargin(root, tip, 0, 5, 0, 23);
@@ -327,6 +332,32 @@ public final class MainActivity extends Activity {
                             ((AudioStream) a.stream).getAverageBitrate()));
                     fetched.addAll(audioChoices);
                 }
+                // YouTube often returns DASH video-only streams and separate audio streams.
+                // Only offer combinations Android MediaMuxer can join without transcoding.
+                List<VideoStream> videoOnly = info.getVideoOnlyStreams();
+                if (videoOnly != null && audioStreams != null) {
+                    AudioStream mp4Audio = bestAudio(audioStreams, "m4a");
+                    AudioStream webmAudio = bestAudio(audioStreams, "webm");
+                    ArrayList<Choice> joined = new ArrayList<>();
+                    for (VideoStream video : videoOnly) {
+                        if (!video.isUrl() || video.getDeliveryMethod() != DeliveryMethod.PROGRESSIVE_HTTP) continue;
+                        MediaFormat fmt = video.getFormat();
+                        if (fmt == null) continue;
+                        String suffix = fmt.getSuffix().toLowerCase(Locale.ROOT);
+                        if (!"mp4".equals(suffix) && !"webm".equals(suffix)) continue;
+                        AudioStream audio = "mp4".equals(suffix) ? mp4Audio : webmAudio;
+                        if (audio == null) continue;
+                        joined.add(new Choice(video,
+                                "Видео со звуком · " + video.getResolution() + " · " + suffix.toUpperCase(Locale.ROOT) + " · объединение",
+                                suffix, "mp4".equals(suffix) ? "video/mp4" : "video/webm", false, audio));
+                    }
+                    joined.sort((a, b) -> {
+                        // Prefer MP4 over WebM, then higher resolutions.
+                        int fp = Integer.compare("mp4".equals(b.extension) ? 1 : 0, "mp4".equals(a.extension) ? 1 : 0);
+                        return fp != 0 ? fp : Integer.compare(((VideoStream) b.stream).getHeight(), ((VideoStream) a.stream).getHeight());
+                    });
+                    fetched.addAll(0, joined);
+                }
                 String title = info.getName();
                 runOnUiThread(() -> {
                     analyzing = false;
@@ -351,10 +382,72 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private static AudioStream bestAudio(List<AudioStream> streams, String ext) {
+        AudioStream selected = null;
+        int best = Integer.MIN_VALUE;
+        for (AudioStream stream : streams) {
+            if (!stream.isUrl() || stream.getDeliveryMethod() != DeliveryMethod.PROGRESSIVE_HTTP) continue;
+            MediaFormat format = stream.getFormat();
+            if (format == null || !ext.equalsIgnoreCase(format.getSuffix())) continue;
+            boolean isRussian = stream.getAudioLocale() != null && "ru".equals(stream.getAudioLocale().getLanguage());
+            int score = stream.getAverageBitrate() + (isRussian ? 1000000 : 0);
+            if (score > best) { selected = stream; best = score; }
+        }
+        return selected;
+    }
+
+    private void startCombinedDownload(Choice choice) {
+        String videoUrl = choice.stream.getContent();
+        String audioUrl = choice.companionAudio.getContent();
+        if (!videoUrl.startsWith("https://") || !audioUrl.startsWith("https://")) {
+            log("ОШИБКА: видео и звук должны иметь ссылки HTTPS");
+            return;
+        }
+        final String filename = makeFileName(videoTitle, choice.extension);
+        final boolean webm = "webm".equals(choice.extension);
+        downloadButton.setEnabled(false);
+        analyzeButton.setEnabled(false);
+        progress.setProgress(0);
+        progressText.setText("Начинаю скачивание видео со звуком…");
+        savePathText.setText("Папка: Загрузки / Кино на работе / " + filename);
+        log("Видео со звуком: " + choice.label + " · " + filename);
+        workers.execute(() -> {
+            try {
+                Uri saved = MuxDownload.download(getApplicationContext(), videoUrl, audioUrl,
+                        filename, webm, new MuxDownload.Listener() {
+                            @Override public void onProgress(String stage, int percent) {
+                                runOnUiThread(() -> {
+                                    progress.setProgress(percent);
+                                    progressText.setText(percent + "% · " + stage);
+                                });
+                            }
+                            @Override public void onLog(String message) {
+                                runOnUiThread(() -> log(message));
+                            }
+                        });
+                runOnUiThread(() -> {
+                    progress.setProgress(100);
+                    progressText.setText("Готово! Сохранено: " + filename);
+                    log("Файл доступен в системной папке Загрузки · " + saved);
+                    downloadButton.setEnabled(true);
+                    analyzeButton.setEnabled(true);
+                });
+            } catch (Exception ex) {
+                runOnUiThread(() -> {
+                    progressText.setText("Ошибка загрузки видео. Скопируйте журнал.");
+                    log("ОШИБКА объединения: " + ex.getClass().getSimpleName() + ": " + safe(ex.getMessage()));
+                    downloadButton.setEnabled(true);
+                    analyzeButton.setEnabled(true);
+                });
+            }
+        });
+    }
+
     private void startDownload() {
         int index = qualitySpinner.getSelectedItemPosition();
         if (index < 0 || index >= choices.size()) return;
         Choice selected = choices.get(index);
+        if (selected.companionAudio != null) { startCombinedDownload(selected); return; }
         if (!selected.stream.isUrl()) { log("ОШИБКА: выбранный формат не является прямым URL"); return; }
         String sourceUrl = selected.stream.getContent();
         if (!sourceUrl.startsWith("https://")) { log("ОШИБКА: поток не HTTPS"); return; }
