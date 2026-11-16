@@ -1,0 +1,4 @@
+The application source code is distributed under GNU GPL v3 or later.
+This project uses NewPipeExtractor (TeamNewPipe), available under GPL-3.0-or-later.
+See https://www.gnu.org/licenses/gpl-3.0.html for the full license text.
+All names and trademarks belong to their respective owners.
